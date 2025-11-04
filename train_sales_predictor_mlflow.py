@@ -1,8 +1,33 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Treinador de modelo de predição de vendas com TensorFlow (Keras).
 
+- Entrada: CSV com colunas ["date","value","num_items"], uma linha por dia.
+- Saída: Modelo salvo (sales_value_model.keras) que prediz o valor de vendas do DIA SEGUINTE
+         a partir de atributos de calendário e lags (últimos 7 dias).
+
+Como executar:
+    1) python -m venv .venv && source .venv/bin/activate  # (Linux/macOS)
+       # No Windows (PowerShell):
+       #   py -3 -m venv .venv ; .\.venv\Scripts\Activate.ps1
+    2) pip install -U tensorflow pandas numpy scikit-learn
+       # Opcional (para tracking): pip install -U mlflow
+    3) python train_sales_predictor.py --csv_path sales_dataset.csv
+
+Dica: Ajuste épocas/neurônios se quiser treinar mais/menos.
+"""
 import argparse
 import json
 import math
 import os
+
+# --- Guardas de ambiente ANTES do TensorFlow (reduz ruído/mutex) ---
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("ABSL_MUTEX_PROFILE", "0")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
 
 import numpy as np
 import pandas as pd
@@ -110,9 +135,6 @@ def train(
     print("Metadados salvos em: model_meta.json")
 
     # Exemplo de inferência para o dia seguinte ao último do dataset
-    # (usa as últimas janelas disponíveis)
-    # Preparar a última linha de features:
-    # Reconstroi as features a partir do df original para facilitar.
     X_all, _, feature_names_all, dates_all = build_features(df, lags=lags)
     last_feat = X_all[-1:]
     next_value_pred = float(model.predict(last_feat, verbose=0).ravel()[0])
@@ -142,10 +164,73 @@ def main():
         default=7,
         help="Quantidade de lags diários para usar como features",
     )
+
+    # ---- Flags opcionais (MLflow + CPU-only) ----
+    parser.add_argument(
+        "--mlflow", action="store_true", help="Habilita tracking com MLflow (opcional)"
+    )
+    parser.add_argument(
+        "--mlflow_tracking_uri",
+        type=str,
+        default=None,
+        help="URI do servidor MLflow (ex.: http://localhost:5000)",
+    )
+    parser.add_argument(
+        "--mlflow_experiment",
+        type=str,
+        default="sales-forecast-poc",
+        help="Nome do experimento MLflow",
+    )
+    parser.add_argument(
+        "--mlflow_register",
+        action="store_true",
+        help="Registra o modelo no MLflow Model Registry",
+    )
+    parser.add_argument(
+        "--registered_model_name",
+        type=str,
+        default="SalesValueModel",
+        help="Nome do modelo no Registry (se --mlflow_register)",
+    )
+    parser.add_argument(
+        "--cpu_only",
+        action="store_true",
+        help="Desabilita GPU/Metal e roda só em CPU (útil em macOS)",
+    )
+
     args = parser.parse_args()
 
-    train(csv_path=args.csv_path, out_model_path=args.out_model, lags=args.lags)
+    # CPU-only, se solicitado
+    if args.cpu_only:
+        try:
+            tf.config.set_visible_devices([], "GPU")
+        except Exception:
+            pass
 
+    # Caminho feliz original (sem MLflow): NADA muda
+    if not args.mlflow:
+        train(csv_path=args.csv_path, out_model_path=args.out_model, lags=args.lags)
+        return
 
-if __name__ == "__main__":
-    main()
+    # --- MLflow opcional (acoplado, sem mexer no treino) ---
+    import mlflow
+    import mlflow.tensorflow
+
+    if args.mlflow_tracking_uri:
+        mlflow.set_tracking_uri(args.mlflow_tracking_uri)
+    mlflow.set_experiment(args.mlflow_experiment)
+
+    # Autolog para capturar métricas do Keras .fit
+    mlflow.tensorflow.autolog(log_models=False)
+
+    with mlflow.start_run() as run:
+        run_id = run.info.run_id
+        # Executa o treino exatamente como antes
+        train(csv_path=args.csv_path, out_model_path=args.out_model, lags=args.lags)
+
+        # Loga artefatos gerados (modelo e meta)
+        if os.path.exists(args.out_model):
+            mlflow.log_artifact(args.out_model)
+        if os.path.exists("model_meta.json"):
+            mlflow.log_artifact("model_meta.json")
+            # (opcional) ler métr
